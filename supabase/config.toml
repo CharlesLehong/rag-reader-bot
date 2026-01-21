@@ -1,0 +1,10 @@
+project_id = "guibuakjvdvbalvzvwoe"
+
+[functions.upload-document]
+verify_jwt = false
+
+[functions.ask-question]
+verify_jwt = false
+
+[functions.parse-prompt-document]
+verify_jwt = false

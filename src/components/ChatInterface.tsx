@@ -1,0 +1,426 @@
+import { useState, useRef, useEffect } from "react";
+import { Send, Bot, User, Loader2, Trash2, Paperclip, X, Upload, FileText } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { useToast } from "@/hooks/use-toast";
+import { supabase } from "@/integrations/supabase/client";
+import type { UploadedDocument } from "@/pages/Index";
+import { Badge } from "@/components/ui/badge";
+import { useLocalStorage } from "@/hooks/use-local-storage";
+
+interface Message {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+}
+
+interface ChatInterfaceProps {
+  documents: UploadedDocument[];
+  onReportGenerated: (html: string, data: any) => void;
+  customPrompt: string | null;
+  questionsTemplate: any[] | null;
+  resetTrigger?: number;
+  onClearChat?: () => void;
+}
+
+export const ChatInterface = ({ documents, onReportGenerated, customPrompt, questionsTemplate, resetTrigger, onClearChat }: ChatInterfaceProps) => {
+  const [messages, setMessages] = useLocalStorage<Message[]>("chatMessages", []);
+  const [input, setInput] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [hasProcessedQuestions, setHasProcessedQuestions] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
+
+  // Watch for reset trigger from parent
+  useEffect(() => {
+    if (resetTrigger && resetTrigger > 0) {
+      setMessages([]);
+      setAttachedFiles([]);
+      setInput("");
+      setHasProcessedQuestions(false);
+    }
+  }, [resetTrigger]);
+
+  // Auto-process when questions template is uploaded
+  useEffect(() => {
+    const autoProcessQuestions = async () => {
+      // Only auto-process if:
+      // 1. Questions template exists
+      // 2. Documents are uploaded
+      // 3. Haven't already processed these questions
+      // 4. Not currently loading
+      if (questionsTemplate && questionsTemplate.length > 0 &&
+          documents.length > 0 &&
+          !hasProcessedQuestions &&
+          !isLoading) {
+
+        console.log("Auto-processing questions template...");
+        setHasProcessedQuestions(true);
+
+        // Create a user message indicating batch processing
+        const userMessage: Message = {
+          id: Date.now().toString(),
+          role: "user",
+          content: `Processing ${questionsTemplate.length} questions from uploaded template...`,
+        };
+
+        setMessages((prev) => [...prev, userMessage]);
+        setIsLoading(true);
+
+        try {
+          const allFiles = documents.map((doc) => ({
+            fileId: doc.id,
+            fileName: doc.name,
+            content: doc.content,
+            isJson: doc.isJson
+          }));
+
+          const { data, error } = await supabase.functions.invoke("ask-question", {
+            body: {
+              question: "Please process all questions from the uploaded template systematically.",
+              files: allFiles,
+              customPrompt: customPrompt,
+              questionsTemplate: questionsTemplate,
+              generateReport: true,
+            },
+          });
+
+          if (error) throw error;
+
+          const assistantMessage: Message = {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: data.answer,
+          };
+
+          setMessages((prev) => [...prev, assistantMessage]);
+
+          if (data.reportHtml) {
+            onReportGenerated(data.reportHtml, data.reportData);
+          }
+
+          toast({
+            title: "Questions Processed",
+            description: `Successfully answered ${questionsTemplate.length} questions`,
+          });
+        } catch (error) {
+          console.error("Auto-process error:", error);
+          toast({
+            title: "Error",
+            description: error instanceof Error ? error.message : "Failed to process questions",
+            variant: "destructive",
+          });
+          setHasProcessedQuestions(false); // Allow retry
+        } finally {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    autoProcessQuestions();
+  }, [questionsTemplate, documents, hasProcessedQuestions, isLoading]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages]);
+
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    const validFiles = files.filter((file) => {
+      const type = file.type;
+      const name = file.name.toLowerCase();
+      const isPdf = type === "application/pdf" || name.endsWith(".pdf");
+      const isJson = type === "application/json" || name.endsWith(".json");
+      const isTxt = type === "text/plain" || name.endsWith(".txt");
+      return isPdf || isJson || isTxt;
+    });
+
+    if (validFiles.length !== files.length) {
+      toast({
+        title: "Invalid file type",
+        description: "Only PDF, JSON, and TXT files are supported",
+        variant: "destructive",
+      });
+    }
+
+    setAttachedFiles((prev) => [...prev, ...validFiles]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  const handleRemoveAttachment = (index: number) => {
+    setAttachedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() || isLoading || isUploading) return;
+
+    if (documents.length === 0 && attachedFiles.length === 0) {
+      toast({
+        title: "No documents",
+        description: "Please upload a document or attach files to your question",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: "user",
+      content: input,
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
+    setInput("");
+    setIsLoading(true);
+
+    try {
+      // Upload attached files first if any
+      let attachedDocs: { fileId: string; fileName?: string; content?: string; isJson?: boolean }[] = [];
+      if (attachedFiles.length > 0) {
+        setIsUploading(true);
+        for (const file of attachedFiles) {
+          const formData = new FormData();
+          formData.append("file", file);
+
+          const { data: uploadData, error: uploadError } = await supabase.functions.invoke(
+            "upload-document",
+            {
+              body: formData,
+            }
+          );
+
+          if (uploadError) throw uploadError;
+          attachedDocs.push({
+            fileId: uploadData.fileId,
+            fileName: uploadData.displayName || file.name,
+            content: uploadData.content,
+            isJson: uploadData.fileId?.startsWith('json-'),
+          });
+        }
+        setIsUploading(false);
+        setAttachedFiles([]);
+      }
+
+      // Combine all file data
+      const allFiles = [
+        ...documents.map((doc) => ({ 
+          fileId: doc.id,
+          fileName: doc.name,
+          content: doc.content,
+          isJson: doc.isJson 
+        })),
+        ...attachedDocs,
+      ];
+
+      const { data, error } = await supabase.functions.invoke("ask-question", {
+        body: {
+          question: input,
+          files: allFiles,
+          customPrompt: customPrompt,
+          questionsTemplate: questionsTemplate,
+          generateReport: true,
+        },
+      });
+
+      if (error) throw error;
+
+      const assistantMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: data.answer,
+      };
+
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      // If report HTML is generated, pass it up
+      if (data.reportHtml) {
+        onReportGenerated(data.reportHtml, data.reportData);
+      }
+    } catch (error) {
+      console.error("Question error:", error);
+      toast({
+        title: "Error",
+        description: error instanceof Error ? error.message : "Failed to get answer",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+      setIsUploading(false);
+    }
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleClearChat = () => {
+    setMessages([]);
+    onClearChat?.();
+    toast({
+      title: "Chat cleared",
+      description: "Conversation history has been reset",
+    });
+  };
+
+  return (
+    <Card className="h-full flex flex-col shadow-elegant">
+      <CardContent className="flex-1 flex flex-col p-0">
+        {/* Messages Area */}
+        <ScrollArea className="flex-1 p-6">
+          {messages.length === 0 ? (
+            <div className="h-full flex items-center justify-center">
+              <div className="text-center max-w-md">
+                <div className="h-16 w-16 rounded-2xl bg-gradient-primary flex items-center justify-center mx-auto mb-4 shadow-elegant">
+                  <Bot className="h-8 w-8 text-white" />
+                </div>
+                <h3 className="text-xl font-semibold text-foreground mb-2">
+                  Ready to Answer Your Questions
+                </h3>
+                <p className="text-muted-foreground">
+                  Upload a document and ask me anything about its content. I'll provide accurate
+                  answers based on the information in your files.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {messages.map((message) => (
+                <div
+                  key={message.id}
+                  className={`flex gap-4 ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  {message.role === "assistant" && (
+                    <div className="h-8 w-8 rounded-lg bg-gradient-primary flex items-center justify-center flex-shrink-0">
+                      <Bot className="h-5 w-5 text-white" />
+                    </div>
+                  )}
+                  <div
+                    className={`
+                      max-w-[80%] rounded-2xl px-4 py-3 shadow-soft
+                      ${
+                        message.role === "user"
+                          ? "bg-gradient-primary text-white"
+                          : "bg-card border border-border"
+                      }
+                    `}
+                  >
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                      {message.content}
+                    </p>
+                  </div>
+                  {message.role === "user" && (
+                    <div className="h-8 w-8 rounded-lg bg-secondary flex items-center justify-center flex-shrink-0">
+                      <User className="h-5 w-5 text-secondary-foreground" />
+                    </div>
+                  )}
+                </div>
+              ))}
+              {isLoading && (
+                <div className="flex gap-4 justify-start">
+                  <div className="h-8 w-8 rounded-lg bg-gradient-primary flex items-center justify-center flex-shrink-0">
+                    <Bot className="h-5 w-5 text-white" />
+                  </div>
+                  <div className="bg-card border border-border rounded-2xl px-4 py-3 shadow-soft">
+                    <Loader2 className="h-5 w-5 text-primary animate-spin" />
+                  </div>
+                </div>
+              )}
+              <div ref={scrollRef} />
+            </div>
+          )}
+        </ScrollArea>
+
+        {/* Input Area */}
+        <div className="border-t border-border p-4 bg-card">
+          {/* Attached Files Display */}
+          {attachedFiles.length > 0 && (
+            <div className="mb-3 flex flex-wrap gap-2">
+              {attachedFiles.map((file, index) => (
+                <div
+                  key={index}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-secondary rounded-lg text-sm"
+                >
+                  <Paperclip className="h-3 w-3" />
+                  <span className="text-secondary-foreground">{file.name}</span>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-5 w-5"
+                    onClick={() => handleRemoveAttachment(index)}
+                  >
+                    <X className="h-3 w-3" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            {messages.length > 0 && (
+              <Button
+                onClick={handleClearChat}
+                variant="outline"
+                size="icon"
+                title="Clear chat"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            )}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.json,.txt"
+              multiple
+              onChange={handleFileSelect}
+              className="hidden"
+            />
+            <Button
+              onClick={() => fileInputRef.current?.click()}
+              variant="outline"
+              size="icon"
+              title="Attach PDF, JSON, or TXT files"
+              disabled={isLoading || isUploading}
+            >
+              <Paperclip className="h-4 w-4" />
+            </Button>
+            <Textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyPress}
+              placeholder={
+                questionsTemplate && questionsTemplate.length > 0
+                  ? "Questions template uploaded - will auto-process when documents are ready..."
+                  : documents.length === 0 && attachedFiles.length === 0
+                  ? "Upload documents or attach files to ask questions..."
+                  : "Ask a question about your documents..."
+              }
+              disabled={isLoading || isUploading || (questionsTemplate && questionsTemplate.length > 0)}
+              className="flex-1 min-h-[80px] max-h-[200px] resize-none"
+              rows={3}
+            />
+            <Button
+              onClick={handleSend}
+              disabled={!input.trim() || isLoading || isUploading || (documents.length === 0 && attachedFiles.length === 0)}
+              className="bg-gradient-primary hover:opacity-90 transition-opacity"
+              size="icon"
+            >
+              {isUploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            </Button>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+};
